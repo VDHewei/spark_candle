@@ -60,6 +60,8 @@ fn main() -> Result<()> {
             tui::run(engine, args)
         }
         Command::Serve(args) => {
+            // 先校验 TLS 参数，避免模型加载完成后才报错
+            args.tls_pair()?;
             let _log_guard = init_logging(&args.common, true)?;
             tracing::info!(
                 target: "app",

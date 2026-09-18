@@ -7,6 +7,7 @@ use candle_core::{DType, Device, IndexOp, Tensor, D};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::UNIX_EPOCH;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 use tokenizers::Tokenizer;
@@ -20,11 +21,11 @@ pub struct GenOptions {
     pub seed: Option<u64>,
     pub enable_thinking: bool,
 }
-
+pub const DEFAULT_MAX_TOKEN: usize = 8192; // 512
 impl Default for GenOptions {
     fn default() -> Self {
         Self {
-            max_tokens: 512,
+            max_tokens: DEFAULT_MAX_TOKEN,
             temperature: 0.7,
             top_p: 0.95,
             seed: None,
@@ -76,6 +77,24 @@ impl GenSlot {
     }
 }
 
+/// 模型元信息：供 HTTP 接口描述当前加载的模型（Ollama /api/tags、/api/show 等）
+#[derive(Debug, Clone)]
+pub struct ModelInfo {
+    pub id: String,
+    /// 权重文件总大小（字节）
+    pub size_bytes: u64,
+    /// 权重文件最后修改时间（Unix 秒）
+    pub modified_secs: u64,
+    /// 计算精度，如 F16 / BF16 / F32
+    pub dtype: String,
+    pub max_context: usize,
+    pub layers: usize,
+    pub heads: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    pub vocab: usize,
+}
+
 /// 只读的模型资源，可在线程间安全共享
 struct EngineInner {
     model: SparkModel,
@@ -86,6 +105,25 @@ struct EngineInner {
     system: Option<String>,
     max_context: usize,
     model_id: String,
+    size_bytes: u64,
+    modified_secs: u64,
+    dtype: String,
+}
+
+/// 统计权重文件的总大小与最后修改时间
+fn weight_stats(paths: &[PathBuf]) -> (u64, u64) {
+    let mut size = 0u64;
+    let mut mtime = 0u64;
+    for p in paths {
+        let Ok(meta) = std::fs::metadata(p) else { continue };
+        size += meta.len();
+        if let Ok(modified) = meta.modified() {
+            if let Ok(d) = modified.duration_since(UNIX_EPOCH) {
+                mtime = mtime.max(d.as_secs());
+            }
+        }
+    }
+    (size, mtime)
 }
 
 #[derive(Clone)]
@@ -155,6 +193,7 @@ impl Engine {
         println!("【系统提示】正在初始化 Spark 模型结构并绑定权重...");
         let model = SparkModel::load(vb, &cfg, max_context)?;
 
+        let (size_bytes, modified_secs) = weight_stats(&files.weights);
         let model_id = repo_id.rsplit('/').next().unwrap_or(repo_id).to_string();
         let engine = Engine {
             inner: Arc::new(EngineInner {
@@ -166,6 +205,9 @@ impl Engine {
                 system,
                 max_context,
                 model_id,
+                size_bytes,
+                modified_secs,
+                dtype: format!("{:?}", dtype),
             }),
             session: Arc::new(Mutex::new(Session {
                 tokens: Vec::new(),
@@ -197,6 +239,23 @@ impl Engine {
 
     pub fn max_context(&self) -> usize {
         self.inner.max_context
+    }
+
+    /// 当前加载模型的元信息（大小、精度、结构参数等）
+    pub fn model_info(&self) -> ModelInfo {
+        let cfg = &self.inner.cfg;
+        ModelInfo {
+            id: self.inner.model_id.clone(),
+            size_bytes: self.inner.size_bytes,
+            modified_secs: self.inner.modified_secs,
+            dtype: self.inner.dtype.clone(),
+            max_context: self.inner.max_context,
+            layers: cfg.num_hidden_layers,
+            heads: cfg.num_attention_heads,
+            kv_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim(),
+            vocab: cfg.vocab_size,
+        }
     }
 
     /// 清空会话（丢弃 KV-Cache）

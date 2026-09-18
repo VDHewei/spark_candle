@@ -38,6 +38,9 @@ crossterm = "0.28"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
+# HTTPS（rustls + ring 后端，证书/私钥由 --tls-cert / --tls-key 指定）
+axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 [profile.release]
 opt-level = 3

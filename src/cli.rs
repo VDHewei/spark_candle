@@ -1,6 +1,7 @@
 //! 命令行参数定义
 
 use clap::{Args, Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -36,7 +37,7 @@ pub struct CommonArgs {
     pub dtype: Option<String>,
 
     /// 上下文上限（Prompt + 生成）
-    #[arg(long, default_value_t = 4096)]
+    #[arg(long, default_value_t = 8192)]
     pub max_context: usize,
 
     /// 默认系统提示词
@@ -86,7 +87,7 @@ impl Default for CommonArgs {
             dtype: None,
             max_context: 4096,
             system: None,
-            max_tokens: 512,
+            max_tokens: 8192, // 512
             temperature: 0.7,
             top_p: 0.95,
             seed: None,
@@ -109,6 +110,25 @@ pub struct ServeArgs {
     /// 监听端口
     #[arg(long, default_value_t = 8000)]
     pub port: u16,
+
+    /// TLS 证书文件（PEM，可含完整证书链）；与 --tls-key 同时指定时启用 HTTPS
+    #[arg(long, value_name = "FILE")]
+    pub tls_cert: Option<PathBuf>,
+
+    /// TLS 私钥文件（PEM，支持 PKCS#1 / PKCS#8 / SEC1）
+    #[arg(long, value_name = "FILE")]
+    pub tls_key: Option<PathBuf>,
+}
+
+impl ServeArgs {
+    /// 校验并返回 TLS 证书 / 私钥路径；两者必须成对出现，都缺省则走明文 HTTP
+    pub fn tls_pair(&self) -> anyhow::Result<Option<(&PathBuf, &PathBuf)>> {
+        match (&self.tls_cert, &self.tls_key) {
+            (Some(cert), Some(key)) => Ok(Some((cert, key))),
+            (None, None) => Ok(None),
+            _ => anyhow::bail!("启用 HTTPS 需要同时指定 --tls-cert 与 --tls-key"),
+        }
+    }
 }
 
 impl CommonArgs {
