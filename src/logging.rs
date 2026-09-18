@@ -47,7 +47,7 @@ pub fn init(log_dir: &Path, level: &str, console: bool) -> Result<LogGuard> {
         .with_context(|| format!("创建日志目录失败: {}", log_dir.display()))?;
 
     // 每天一个文件：logs/spark.log.YYYY-MM-DD
-    let appender = tracing_appender::rolling::daily(log_dir, "spark.log");
+    let appender = tracing_appender::rolling::daily(log_dir, "spark.log.jsonl");
     let (non_blocking, guard) = tracing_appender::non_blocking(appender);
 
     let filter =
