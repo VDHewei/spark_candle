@@ -20,6 +20,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 /// 按共用参数初始化日志，返回值需存活到程序结束
+///
+/// # 参数
+/// - `common`：含 `--log-dir` / `--log-level` 的共用参数
+/// - `console`：是否同时输出到控制台（TUI 模式传 `false`）
 fn init_logging(common: &CommonArgs, console: bool) -> Result<LogGuard> {
     let guard = logging::init(Path::new(&common.log_dir), &common.log_level, console)?;
     println!("【系统提示】日志文件目录: {}", common.log_dir);
@@ -27,6 +31,13 @@ fn init_logging(common: &CommonArgs, console: bool) -> Result<LogGuard> {
 }
 
 /// 按共用参数加载模型（TUI / HTTP 两种模式共用）
+///
+/// 加载前先打一条 `target: "app"` 的启动日志，把实际生效的
+/// `max_context` 与 `max_tokens` 记录下来，便于事后核对配置。
+///
+/// # 参数
+/// - `common`：模型 / 精度 / 上下文 / 采样等共用参数
+/// - `mode`：`"chat"` 或 `"serve"`，仅用于日志区分
 fn load_engine(common: &CommonArgs, mode: &str) -> Result<Arc<Engine>> {
     tracing::info!(
         target: "app",
@@ -45,6 +56,13 @@ fn load_engine(common: &CommonArgs, mode: &str) -> Result<Arc<Engine>> {
     )
 }
 
+/// 程序入口：解析命令行后分派到 TUI 对话或 HTTP 服务
+///
+/// - `chat`：日志只落盘（终端被 TUI 独占），加载模型后进入 `tui::run`
+/// - `serve`：先校验 TLS 参数，再建 Tokio 多线程运行时并进入 `server::run`
+///
+/// # 返回
+/// 任一环节失败（日志目录不可写、模型下载失败、端口被占用等）时返回错误
 fn main() -> Result<()> {
     let cli = Cli::parse();
 

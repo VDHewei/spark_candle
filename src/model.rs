@@ -11,15 +11,19 @@ use std::path::PathBuf;
 // ==========================================
 // 0. 常用默认值
 // ==========================================
+/// `rope_theta` 的默认值（config.json 未给出时使用）
 fn default_rope_theta() -> f32 {
     10000.0
 }
+/// `partial_rotary_factor` 的默认值：对全部 head_dim 做旋转
 fn one() -> f32 {
     1.0
 }
+/// `tie_word_embeddings` 的默认值：嵌入与输出头共享权重
 fn yes() -> bool {
     true
 }
+/// `gate_attn_act_mode` 的默认值：注意力输出门控用 sigmoid
 fn default_gate_act() -> String {
     "sigmoid".to_string()
 }
@@ -27,14 +31,18 @@ fn default_gate_act() -> String {
 // ==========================================
 // 1. 模型配置结构体
 // ==========================================
+/// 一类注意力层（full / sliding）各自的 RoPE 参数
 #[derive(Deserialize, Debug, Clone)]
 pub struct RopeParam {
+    /// 参与旋转的维度比例：1.0 表示整个 head_dim 都旋转
     #[serde(default = "one")]
     pub partial_rotary_factor: f32,
+    /// RoPE 的基频 θ
     #[serde(default = "default_rope_theta")]
     pub rope_theta: f32,
 }
 
+/// 默认 RoPE 参数：全部维度参与旋转、θ = 10000
 impl Default for RopeParam {
     fn default() -> Self {
         Self {
@@ -44,22 +52,36 @@ impl Default for RopeParam {
     }
 }
 
+/// 混合注意力模型下两类层各自独立的 RoPE 参数集合
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct RopeParameters {
+    /// 全注意力层使用的参数
     #[serde(default)]
     pub full_attention: RopeParam,
+    /// 滑动窗口层使用的参数
     #[serde(default)]
     pub sliding_attention: RopeParam,
 }
 
+/// `config.json` 的完整结构映射
+///
+/// 字段缺省时尽量给出与官方 `modeling_spark.py` 一致的兜底值，
+/// 以便兼容不同版本 / 不同体量的 checkpoint。
 #[derive(Deserialize, Debug, Clone)]
 pub struct SparkConfig {
+    /// 词表大小
     pub vocab_size: usize,
+    /// 隐藏层维度
     pub hidden_size: usize,
+    /// FFN 中间层维度
     pub intermediate_size: usize,
+    /// 解码层数
     pub num_hidden_layers: usize,
+    /// 查询头数
     pub num_attention_heads: usize,
+    /// KV 头数（GQA，通常小于查询头数）
     pub num_key_value_heads: usize,
+    /// RMSNorm 的 eps
     pub rms_norm_eps: f64,
 
     // Spark-X2.5 显式给出 head_dim（2048/8=256，但不要自己算，直接信任配置）
@@ -94,6 +116,10 @@ pub struct SparkConfig {
 }
 
 impl SparkConfig {
+    /// 每个注意力头的维度
+    ///
+    /// Spark-X2.5 显式给出了 `head_dim`（2048 / 8 = 256），
+    /// 直接信任配置；没有时才按 `hidden_size / num_attention_heads` 推算。
     pub fn head_dim(&self) -> usize {
         self.head_dim
             .unwrap_or(self.hidden_size / self.num_attention_heads)
@@ -114,11 +140,18 @@ impl SparkConfig {
         }
     }
 
+    /// 该层是否为滑动窗口注意力层
     pub fn is_sliding(&self, layer_idx: usize) -> bool {
         self.layer_type(layer_idx) == "sliding_attention"
     }
 
-    /// 返回 (rope_theta, partial_rotary_factor)
+    /// 取指定层类型的 RoPE 参数
+    ///
+    /// # 参数
+    /// - `layer_type`：`"full_attention"` 或 `"sliding_attention"`
+    ///
+    /// # 返回
+    /// `(rope_theta, partial_rotary_factor)`；config 未给出时用默认值
     pub fn rope_params(&self, layer_type: &str) -> (f32, f32) {
         if let Some(rp) = &self.rope_parameters {
             let p = if layer_type == "sliding_attention" {
@@ -136,17 +169,33 @@ impl SparkConfig {
 // ==========================================
 // 2. RMSNorm 层实现
 // ==========================================
+/// RMSNorm：只对最后一维做归一化，带可学习缩放
 pub struct RmsNorm {
+    /// 缩放权重，形状 `[hidden_size]`
     weight: Tensor,
+    /// 数值稳定的 eps
     eps: f64,
 }
 
 impl RmsNorm {
+    /// 从 VarBuilder 的当前前缀下读取 `weight`
+    ///
+    /// # 参数
+    /// - `dim`：权重长度（= hidden_size）
+    /// - `eps`：归一化 eps
+    /// - `vb`：定位到该 norm 层的 VarBuilder
     pub fn load(dim: usize, eps: f64, vb: VarBuilder) -> CandleResult<Self> {
         let weight = vb.get(dim, "weight")?;
         Ok(Self { weight, eps })
     }
 
+    /// 前向：内部强制用 FP32 计算再转回原精度，与 PyTorch 实现保持一致
+    ///
+    /// # 参数
+    /// - `xs`：输入张量，形状 `[b, seq, hidden]`
+    ///
+    /// # 返回
+    /// 与输入同形状、同精度的归一化结果
     pub fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
         let dtype = xs.dtype();
         // 与 PyTorch 实现保持一致：内部强制用 FP32 计算，再转回原精度
@@ -162,7 +211,16 @@ impl RmsNorm {
 // 3. Rotary Embedding (RoPE)，支持 partial_rotary_factor
 // ==========================================
 
-/// 只对前 rope_dim 维做旋转，其余维度原样透传（与 modeling_spark.py 完全一致）
+/// 施加旋转位置编码：只对前 `rope_dim` 维做旋转，其余维度原样透传
+///
+/// 与官方 `modeling_spark.py` 完全一致，支持 `partial_rotary_factor < 1`。
+///
+/// # 参数
+/// - `x`：Q 或 K，形状 `[b, heads, seq, head_dim]`
+/// - `cos` / `sin`：RoPE 缓存切片，形状 `[seq, rope_dim]`
+///
+/// # 返回
+/// 旋转后的张量，形状与 `x` 相同
 fn apply_rotary_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> CandleResult<Tensor> {
     let (_b_sz, _h, _seq_len, d) = x.dims4()?;
     let rope_dim = cos.dim(D::Minus1)?;
@@ -191,7 +249,20 @@ fn apply_rotary_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> CandleResult<Tens
     out.to_dtype(dtype)
 }
 
-/// freq = 1 / theta^(i / rope_dim)，i 步长 2；返回 (cos, sin)，形状均为 (max_seq_len, rope_dim)
+/// 预计算 RoPE 的 cos / sin 缓存
+///
+/// `freq_i = 1 / theta^(i / rope_dim)`（i 步长 2），随后复制一份拼成完整 rope_dim。
+/// 缓存长度即上下文上限，推理时按 `pos_offset` 切片使用。
+///
+/// # 参数
+/// - `head_dim`：注意力头维度
+/// - `max_seq_len`：缓存覆盖的最大位置数（= `--max-context`）
+/// - `theta`：RoPE 基频
+/// - `partial_rotary_factor`：参与旋转的维度比例
+/// - `device`：计算设备
+///
+/// # 返回
+/// `(cos, sin)`，形状均为 `(max_seq_len, rope_dim)`
 fn create_rope_cache(
     head_dim: usize,
     max_seq_len: usize,
@@ -212,7 +283,13 @@ fn create_rope_cache(
     Ok((freqs.cos()?, freqs.sin()?))
 }
 
-/// GQA：把 (b, kv_heads, s, d) 扩展成 (b, kv_heads * n_rep, s, d)，顺序与 torch 的 repeat_kv 一致
+/// GQA 的 KV 广播：把 `(b, kv_heads, s, d)` 扩展成 `(b, kv_heads * n_rep, s, d)`
+///
+/// 扩展顺序与 torch 官方 `repeat_kv` 保持一致（逐头重复而非整块复制）。
+///
+/// # 参数
+/// - `x`：K 或 V，形状 `[b, kv_heads, s, d]`
+/// - `n_rep`：每个 KV 头对应的查询头数；为 1 时直接原样返回
 fn repeat_kv(x: Tensor, n_rep: usize) -> CandleResult<Tensor> {
     if n_rep == 1 {
         return Ok(x);
@@ -223,7 +300,20 @@ fn repeat_kv(x: Tensor, n_rep: usize) -> CandleResult<Tensor> {
         .reshape((b_sz, n_kv_head * n_rep, seq_len, head_dim))
 }
 
-/// 构造因果掩码（可选滑动窗口），返回 (seq_len, kv_len)，被屏蔽位置为 -inf
+/// 构造因果掩码（可选滑动窗口），被屏蔽位置为 `-inf`
+///
+/// 滑动窗口层在增量解码时会把 cache 裁剪到窗口大小，此时 cache 下标不再等于
+/// 绝对位置，因此这里先把下标换算回绝对位置再做窗口判断。
+///
+/// # 参数
+/// - `seq_len`：本次前向的 Query 长度
+/// - `kv_len`：Key/Value 总长度（含历史 cache）
+/// - `pos_offset`：本次 Query 的起始绝对位置
+/// - `sliding_window`：`Some(w)` 时只可见最近 w 个位置
+/// - `device`：计算设备
+///
+/// # 返回
+/// 形状 `(seq_len, kv_len)` 的加性掩码，需与注意力分数相加
 fn build_attn_mask(
     seq_len: usize,
     kv_len: usize,
@@ -251,26 +341,46 @@ fn build_attn_mask(
 // ==========================================
 // 4. Spark 混合注意力层 (Hybrid Attention + Output Gate)
 // ==========================================
+/// 注意力输出门控的激活函数种类
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GateAct {
+    /// sigmoid(x)
     Sigmoid,
+    /// silu(x)
     Silu,
 }
 
+/// Spark 混合注意力层：融合 QKV 投影 + GQA + 滑动窗口 + 逐头输出门控
 pub struct SparkAttention {
-    q_k_v_proj: Linear, // 融合的 QKV 投影：hidden -> q_dim + 2 * kv_dim
-    g_proj: Option<Linear>, // 注意力输出门控：hidden -> num_heads
+    /// 融合的 QKV 投影：`hidden -> q_dim + 2 * kv_dim`
+    q_k_v_proj: Linear,
+    /// 注意力输出门控：`hidden -> num_heads`；配置关闭时为 `None`
+    g_proj: Option<Linear>,
+    /// 输出投影：`q_dim -> hidden`
     out_proj: Linear,
+    /// 门控激活函数
     gate_act: GateAct,
+    /// 查询头数
     num_heads: usize,
+    /// KV 头数
     num_kv_heads: usize,
+    /// 每头维度
     head_dim: usize,
+    /// `num_heads * head_dim`
     q_dim: usize,
+    /// `num_kv_heads * head_dim`
     kv_dim: usize,
+    /// 滑动窗口大小；`None` 表示全注意力层
     sliding_window: Option<usize>,
 }
 
 impl SparkAttention {
+    /// 从 VarBuilder（已定位到 `self_attn`）加载权重并初始化
+    ///
+    /// # 参数
+    /// - `vb`：定位到本层 `self_attn` 的 VarBuilder
+    /// - `cfg`：模型配置
+    /// - `layer_idx`：层序号，用于判断是否为滑动窗口层
     pub fn load(vb: VarBuilder, cfg: &SparkConfig, layer_idx: usize) -> CandleResult<Self> {
         let head_dim = cfg.head_dim();
         let q_dim = cfg.num_attention_heads * head_dim;
@@ -313,6 +423,17 @@ impl SparkAttention {
         })
     }
 
+    /// 注意力前向，共 8 步：QKV 切分 → 门控分数 → RoPE → 拼 cache → 窗口裁剪
+    /// → GQA 广播 → SDPA（含掩码）→ 输出门控与投影
+    ///
+    /// # 参数
+    /// - `xs`：形状 `[b, seq, hidden]`
+    /// - `cos` / `sin`：本段对应的 RoPE 切片，形状 `[seq, rope_dim]`
+    /// - `kv_cache`：本层的 KV 缓存，函数内部就地更新
+    /// - `pos_offset`：本段的起始绝对位置
+    ///
+    /// # 返回
+    /// 注意力输出，形状 `[b, seq, hidden]`
     pub fn forward(
         &self,
         xs: &Tensor,
@@ -420,13 +541,22 @@ impl SparkAttention {
 // ==========================================
 // 5. MLP 层实现（激活函数为 GELU）
 // ==========================================
+/// 门控 MLP（SwiGLU 变体，激活函数为 GELU）
 pub struct SparkMlp {
+    /// 门控分支投影：`hidden -> intermediate`
     gate_proj: Linear,
+    /// 上投影：`hidden -> intermediate`
     up_proj: Linear,
+    /// 下投影：`intermediate -> hidden`
     down_proj: Linear,
 }
 
 impl SparkMlp {
+    /// 从 VarBuilder（已定位到 `mlp`）加载三个投影矩阵
+    ///
+    /// # 参数
+    /// - `vb`：定位到本层 `mlp` 的 VarBuilder
+    /// - `cfg`：模型配置（取 `hidden_size` / `intermediate_size`）
     pub fn load(vb: VarBuilder, cfg: &SparkConfig) -> CandleResult<Self> {
         let gate_proj = linear_no_bias(cfg.hidden_size, cfg.intermediate_size, vb.pp("gate_proj"))?;
         let up_proj = linear_no_bias(cfg.hidden_size, cfg.intermediate_size, vb.pp("up_proj"))?;
@@ -438,6 +568,15 @@ impl SparkMlp {
         })
     }
 
+    /// 前向：`down_proj(gelu(gate_proj(x)) * up_proj(x))`
+    ///
+    /// 激活分支强制用 FP32 计算（与 PyTorch 行为一致），乘法前再转回输入精度。
+    ///
+    /// # 参数
+    /// - `xs`：形状 `[b, seq, hidden]`
+    ///
+    /// # 返回
+    /// 同形状的 MLP 输出
     pub fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
         // PyTorch: down_proj(act_fn(gate_proj(x)) * up_proj(x))，act_fn = gelu
         let lhs = self

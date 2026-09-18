@@ -15,7 +15,13 @@ use tracing_subscriber::{
     EnvFilter,
 };
 
-/// JSONL 输出层：一条日志一行 JSON，字段展平到顶层
+/// 构造 JSONL 输出层：一条日志一行 JSON，自定义字段展平到顶层
+///
+/// 关闭 ANSI 与 span 信息，保证日志文件可以被 `jq` / 日志系统直接解析。
+///
+/// # 类型参数
+/// - `S`：`tracing` 的 Subscriber 实现
+/// - `W`：写入目标（文件非阻塞 writer 或 `std::io::stdout`）
 fn json_layer<S, W>(writer: W) -> impl tracing_subscriber::Layer<S>
 where
     S: tracing::Subscriber + for<'a> LookupSpan<'a>,
@@ -31,9 +37,14 @@ where
         .flatten_event(true)
 }
 
-/// 保持该值存活到程序结束：丢弃时会把缓冲区中剩余的日志刷盘
+/// 日志守卫：必须存活到程序结束
+///
+/// 内部持有 `tracing_appender` 的后台写入线程句柄，
+/// 一旦被丢弃会触发最后一次 flush，把缓冲区里剩余的日志落盘。
+/// `main` 里用 `let _log_guard = ...` 绑定即可。
 pub struct LogGuard(Option<WorkerGuard>);
 
+/// 析构时触发后台写入线程的最后一次 flush
 impl Drop for LogGuard {
     fn drop(&mut self) {
         // 丢弃 WorkerGuard 会触发后台写入线程最后一次 flush
@@ -41,7 +52,15 @@ impl Drop for LogGuard {
     }
 }
 
-/// 初始化全局日志。level 可被环境变量 RUST_LOG 覆盖；console 为 true 时额外输出到 stdout
+/// 初始化全局日志（进程内只能调用一次，重复调用会 panic）
+///
+/// # 参数
+/// - `log_dir`：日志目录，不存在时自动创建；文件名 `spark.log.jsonl.YYYY-MM-DD`
+/// - `level`：默认过滤级别（error / warn / info / debug / trace），可被 `RUST_LOG` 覆盖
+/// - `console`：是否额外输出到 stdout；TUI 模式必须传 `false`（终端被界面独占）
+///
+/// # 返回
+/// `LogGuard`，需存活到程序结束以保证日志完整刷盘
 pub fn init(log_dir: &Path, level: &str, console: bool) -> Result<LogGuard> {
     std::fs::create_dir_all(log_dir)
         .with_context(|| format!("创建日志目录失败: {}", log_dir.display()))?;
