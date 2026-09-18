@@ -1,0 +1,8 @@
+/target
+*.log
+/logs
+.idea/
+.vscode/
+.claude/
+.docker/
+*.ps1

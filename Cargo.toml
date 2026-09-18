@@ -1,0 +1,43 @@
+[package]
+name = "spark_candle"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "spark_candle"
+path = "src/main.rs"
+
+[dependencies]
+candle-core = "0.8.2"
+candle-nn = "0.8.2"
+tokenizers = "0.20.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+# 新增 hf-hub 依赖
+hf-hub = "0.4.0"
+# 新增 Jinja 模板引擎依赖
+minijinja = { version = "2.1", features = ["json"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# 采样
+rand = "0.8"
+
+# HTTP 服务（OpenAI / Anthropic 兼容）
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+futures-util = "0.3"
+
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+
+# 日志（按天滚动写入 logs/ 目录）
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+
+[profile.release]
+opt-level = 3

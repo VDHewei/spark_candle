@@ -1,0 +1,694 @@
+//! Spark-X2.5 (Spark2_5ForCausalLM) 的 Candle 实现与权重下载逻辑
+
+use anyhow::{Context, Result as AnyhowResult};
+use candle_core::{DType, Device, IndexOp, Module, Result as CandleResult, Tensor, D};
+use candle_nn::{embedding, linear_no_bias, Embedding, Linear, VarBuilder};
+use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
+use serde::Deserialize;
+use serde_json::Value as JsonValue;
+use std::path::PathBuf;
+
+// ==========================================
+// 0. 常用默认值
+// ==========================================
+fn default_rope_theta() -> f32 {
+    10000.0
+}
+fn one() -> f32 {
+    1.0
+}
+fn yes() -> bool {
+    true
+}
+fn default_gate_act() -> String {
+    "sigmoid".to_string()
+}
+
+// ==========================================
+// 1. 模型配置结构体
+// ==========================================
+#[derive(Deserialize, Debug, Clone)]
+pub struct RopeParam {
+    #[serde(default = "one")]
+    pub partial_rotary_factor: f32,
+    #[serde(default = "default_rope_theta")]
+    pub rope_theta: f32,
+}
+
+impl Default for RopeParam {
+    fn default() -> Self {
+        Self {
+            partial_rotary_factor: 1.0,
+            rope_theta: 10000.0,
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct RopeParameters {
+    #[serde(default)]
+    pub full_attention: RopeParam,
+    #[serde(default)]
+    pub sliding_attention: RopeParam,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct SparkConfig {
+    pub vocab_size: usize,
+    pub hidden_size: usize,
+    pub intermediate_size: usize,
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    pub num_key_value_heads: usize,
+    pub rms_norm_eps: f64,
+
+    // Spark-X2.5 显式给出 head_dim（2048/8=256，但不要自己算，直接信任配置）
+    #[serde(default)]
+    pub head_dim: Option<usize>,
+
+    #[serde(default = "yes")]
+    pub tie_word_embeddings: bool,
+
+    #[serde(default)]
+    pub sliding_window: Option<usize>,
+
+    // 逐层类型：sliding_attention / full_attention
+    #[serde(default)]
+    pub layer_types: Vec<String>,
+
+    #[serde(default)]
+    pub rope_parameters: Option<RopeParameters>,
+
+    // 注意力输出门控（headwise_attn_output_gate）
+    #[serde(default)]
+    pub headwise_attn_output_gate: bool,
+
+    #[serde(default = "default_gate_act")]
+    pub gate_attn_act_mode: String,
+
+    #[allow(dead_code)]
+    pub bos_token_id: u32,
+    pub eos_token_id: u32,
+    #[serde(default)]
+    pub pad_token_id: Option<u32>,
+}
+
+impl SparkConfig {
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
+            .unwrap_or(self.hidden_size / self.num_attention_heads)
+    }
+
+    /// 返回该层的类型；config 里没有 layer_types 时按 3:1（sliding:full）兜底
+    pub fn layer_type(&self, layer_idx: usize) -> &'static str {
+        match self.layer_types.get(layer_idx).map(|s| s.as_str()) {
+            Some("full_attention") => "full_attention",
+            Some("sliding_attention") => "sliding_attention",
+            _ => {
+                if layer_idx % 4 == 3 {
+                    "full_attention"
+                } else {
+                    "sliding_attention"
+                }
+            }
+        }
+    }
+
+    pub fn is_sliding(&self, layer_idx: usize) -> bool {
+        self.layer_type(layer_idx) == "sliding_attention"
+    }
+
+    /// 返回 (rope_theta, partial_rotary_factor)
+    pub fn rope_params(&self, layer_type: &str) -> (f32, f32) {
+        if let Some(rp) = &self.rope_parameters {
+            let p = if layer_type == "sliding_attention" {
+                &rp.sliding_attention
+            } else {
+                &rp.full_attention
+            };
+            (p.rope_theta, p.partial_rotary_factor)
+        } else {
+            (default_rope_theta(), 1.0)
+        }
+    }
+}
+
+// ==========================================
+// 2. RMSNorm 层实现
+// ==========================================
+pub struct RmsNorm {
+    weight: Tensor,
+    eps: f64,
+}
+
+impl RmsNorm {
+    pub fn load(dim: usize, eps: f64, vb: VarBuilder) -> CandleResult<Self> {
+        let weight = vb.get(dim, "weight")?;
+        Ok(Self { weight, eps })
+    }
+
+    pub fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
+        let dtype = xs.dtype();
+        // 与 PyTorch 实现保持一致：内部强制用 FP32 计算，再转回原精度
+        let xs = xs.to_dtype(DType::F32)?;
+        let variance = xs.sqr()?.mean_keepdim(D::Minus1)?;
+        let xs = xs.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
+        xs.broadcast_mul(&self.weight.to_dtype(DType::F32)?)?
+            .to_dtype(dtype)
+    }
+}
+
+// ==========================================
+// 3. Rotary Embedding (RoPE)，支持 partial_rotary_factor
+// ==========================================
+
+/// 只对前 rope_dim 维做旋转，其余维度原样透传（与 modeling_spark.py 完全一致）
+fn apply_rotary_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> CandleResult<Tensor> {
+    let (_b_sz, _h, _seq_len, d) = x.dims4()?;
+    let rope_dim = cos.dim(D::Minus1)?;
+
+    let dtype = x.dtype();
+    let x = x.to_dtype(DType::F32)?;
+
+    // cos/sin: (seq_len, rope_dim) -> (1, 1, seq_len, rope_dim)
+    let cos = cos.to_dtype(DType::F32)?.unsqueeze(0)?.unsqueeze(0)?;
+    let sin = sin.to_dtype(DType::F32)?.unsqueeze(0)?.unsqueeze(0)?;
+
+    let x_rot = x.narrow(D::Minus1, 0, rope_dim)?;
+    let half = rope_dim / 2;
+    let x1 = x_rot.narrow(D::Minus1, 0, half)?;
+    let x2 = x_rot.narrow(D::Minus1, half, half)?;
+    // rotate_half(x) = [-x2, x1]
+    let rotated = Tensor::cat(&[&x2.neg()?, &x1], D::Minus1)?;
+    let out_rot = (x_rot.broadcast_mul(&cos)? + rotated.broadcast_mul(&sin)?)?;
+
+    let out = if d > rope_dim {
+        let x_pass = x.narrow(D::Minus1, rope_dim, d - rope_dim)?;
+        Tensor::cat(&[&out_rot, &x_pass], D::Minus1)?
+    } else {
+        out_rot
+    };
+    out.to_dtype(dtype)
+}
+
+/// freq = 1 / theta^(i / rope_dim)，i 步长 2；返回 (cos, sin)，形状均为 (max_seq_len, rope_dim)
+fn create_rope_cache(
+    head_dim: usize,
+    max_seq_len: usize,
+    theta: f32,
+    partial_rotary_factor: f32,
+    device: &Device,
+) -> CandleResult<(Tensor, Tensor)> {
+    let rope_dim = ((head_dim as f32) * partial_rotary_factor).round() as usize;
+    let rope_dim = rope_dim.max(2);
+    let inv_freq: Vec<f32> = (0..rope_dim)
+        .step_by(2)
+        .map(|i| (1.0f64 / (theta as f64).powf(i as f64 / rope_dim as f64)) as f32)
+        .collect();
+    let inv_freq = Tensor::new(inv_freq, device)?;
+    let t = Tensor::arange(0u32, max_seq_len as u32, device)?.to_dtype(DType::F32)?;
+    let freqs = t.unsqueeze(1)?.matmul(&inv_freq.unsqueeze(0)?)?;
+    let freqs = Tensor::cat(&[&freqs, &freqs], D::Minus1)?;
+    Ok((freqs.cos()?, freqs.sin()?))
+}
+
+/// GQA：把 (b, kv_heads, s, d) 扩展成 (b, kv_heads * n_rep, s, d)，顺序与 torch 的 repeat_kv 一致
+fn repeat_kv(x: Tensor, n_rep: usize) -> CandleResult<Tensor> {
+    if n_rep == 1 {
+        return Ok(x);
+    }
+    let (b_sz, n_kv_head, seq_len, head_dim) = x.dims4()?;
+    x.unsqueeze(2)?
+        .expand((b_sz, n_kv_head, n_rep, seq_len, head_dim))?
+        .reshape((b_sz, n_kv_head * n_rep, seq_len, head_dim))
+}
+
+/// 构造因果掩码（可选滑动窗口），返回 (seq_len, kv_len)，被屏蔽位置为 -inf
+fn build_attn_mask(
+    seq_len: usize,
+    kv_len: usize,
+    pos_offset: usize,
+    sliding_window: Option<usize>,
+    device: &Device,
+) -> CandleResult<Tensor> {
+    let mut data = vec![f32::NEG_INFINITY; seq_len * kv_len];
+    // 滑动窗口层在增量解码时会把 cache 裁剪到窗口大小，cache 下标不再等于绝对位置，
+    // 这里把下标换算回绝对位置，窗口判断才不会错位
+    let kv_start = (pos_offset + seq_len).saturating_sub(kv_len);
+    for i in 0..seq_len {
+        let q_pos = pos_offset + i;
+        for j in 0..kv_len {
+            let key_pos = kv_start + j;
+            let visible = key_pos <= q_pos && sliding_window.map_or(true, |w| q_pos - key_pos < w);
+            if visible {
+                data[i * kv_len + j] = 0.0;
+            }
+        }
+    }
+    Tensor::from_vec(data, (seq_len, kv_len), device)
+}
+
+// ==========================================
+// 4. Spark 混合注意力层 (Hybrid Attention + Output Gate)
+// ==========================================
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateAct {
+    Sigmoid,
+    Silu,
+}
+
+pub struct SparkAttention {
+    q_k_v_proj: Linear, // 融合的 QKV 投影：hidden -> q_dim + 2 * kv_dim
+    g_proj: Option<Linear>, // 注意力输出门控：hidden -> num_heads
+    out_proj: Linear,
+    gate_act: GateAct,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    q_dim: usize,
+    kv_dim: usize,
+    sliding_window: Option<usize>,
+}
+
+impl SparkAttention {
+    pub fn load(vb: VarBuilder, cfg: &SparkConfig, layer_idx: usize) -> CandleResult<Self> {
+        let head_dim = cfg.head_dim();
+        let q_dim = cfg.num_attention_heads * head_dim;
+        let kv_dim = cfg.num_key_value_heads * head_dim;
+
+        let q_k_v_proj = linear_no_bias(cfg.hidden_size, q_dim + 2 * kv_dim, vb.pp("q_k_v_proj"))?;
+        let g_proj = if cfg.headwise_attn_output_gate {
+            Some(linear_no_bias(
+                cfg.hidden_size,
+                cfg.num_attention_heads,
+                vb.pp("g_proj"),
+            )?)
+        } else {
+            None
+        };
+        let out_proj = linear_no_bias(q_dim, cfg.hidden_size, vb.pp("out_proj"))?;
+
+        let sliding_window = if cfg.is_sliding(layer_idx) {
+            cfg.sliding_window
+        } else {
+            None
+        };
+
+        let gate_act = match cfg.gate_attn_act_mode.as_str() {
+            "silu" => GateAct::Silu,
+            _ => GateAct::Sigmoid,
+        };
+
+        Ok(Self {
+            q_k_v_proj,
+            g_proj,
+            out_proj,
+            gate_act,
+            num_heads: cfg.num_attention_heads,
+            num_kv_heads: cfg.num_key_value_heads,
+            head_dim,
+            q_dim,
+            kv_dim,
+            sliding_window,
+        })
+    }
+
+    pub fn forward(
+        &self,
+        xs: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        kv_cache: &mut Option<(Tensor, Tensor)>,
+        pos_offset: usize,
+    ) -> CandleResult<Tensor> {
+        let (b_sz, seq_len, _) = xs.dims3()?;
+
+        // 1. 融合 QKV 投影后切分
+        let qkv = self.q_k_v_proj.forward(xs)?;
+        let q = qkv.narrow(D::Minus1, 0, self.q_dim)?;
+        let k = qkv.narrow(D::Minus1, self.q_dim, self.kv_dim)?;
+        let v = qkv.narrow(D::Minus1, self.q_dim + self.kv_dim, self.kv_dim)?;
+
+        let q = q
+            .reshape((b_sz, seq_len, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let k = k
+            .reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let v = v
+            .reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+
+        // 2. 门控分数（在 RoPE 之前由原始 hidden states 计算）
+        let gate_score = match &self.g_proj {
+            None => None,
+            Some(g_proj) => Some(
+                g_proj
+                    .forward(xs)?
+                    .reshape((b_sz, seq_len, self.num_heads, 1))?
+                    .transpose(1, 2)?,
+            ),
+        };
+
+        // 3. 位置编码
+        let q = apply_rotary_emb(&q, cos, sin)?;
+        let k = apply_rotary_emb(&k, cos, sin)?;
+
+        // 4. 拼接历史 KV Cache
+        let (mut k, mut v) = match kv_cache {
+            None => (k, v),
+            Some((prev_k, prev_v)) => {
+                let k = Tensor::cat(&[prev_k as &Tensor, &k], 2)?;
+                let v = Tensor::cat(&[prev_v as &Tensor, &v], 2)?;
+                (k, v)
+            }
+        };
+
+        // 5. 滑动窗口层：增量解码阶段把 cache 裁剪到窗口大小
+        //    （prefill 阶段保留完整 cache，靠 mask 实现窗口注意力）
+        if let Some(window) = self.sliding_window {
+            let kv_len = k.dim(2)?;
+            if seq_len == 1 && kv_len > window {
+                k = k.narrow(2, kv_len - window, window)?;
+                v = v.narrow(2, kv_len - window, window)?;
+            }
+        }
+        *kv_cache = Some((k.clone(), v.clone()));
+        let kv_len = k.dim(2)?;
+
+        // 6. GQA 广播
+        let n_rep = self.num_heads / self.num_kv_heads;
+        let k = repeat_kv(k, n_rep)?;
+        let v = repeat_kv(v, n_rep)?;
+
+        // 7. Scaled Dot-Product Attention
+        let scale = 1.0 / (self.head_dim as f64).sqrt();
+        let att = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+
+        // prefill（seq_len > 1）时必须显式加因果 / 滑动窗口掩码
+        let att = if seq_len > 1 {
+            let mask =
+                build_attn_mask(seq_len, kv_len, pos_offset, self.sliding_window, xs.device())?;
+            att.broadcast_add(&mask.to_dtype(att.dtype())?)?
+        } else {
+            att
+        };
+
+        let att = candle_nn::ops::softmax(&att, D::Minus1)?;
+        let mut context = att.matmul(&v)?; // (b, heads, seq, head_dim)
+
+        // 8. 逐头输出门控
+        if let Some(gate_score) = gate_score {
+            let gate = match self.gate_act {
+                GateAct::Sigmoid => candle_nn::ops::sigmoid(&gate_score.to_dtype(DType::F32)?)?,
+                GateAct::Silu => gate_score.to_dtype(DType::F32)?.silu()?,
+            };
+            context = context
+                .to_dtype(DType::F32)?
+                .broadcast_mul(&gate)?
+                .to_dtype(context.dtype())?;
+        }
+
+        let context = context
+            .transpose(1, 2)?
+            .reshape((b_sz, seq_len, self.num_heads * self.head_dim))?;
+
+        self.out_proj.forward(&context)
+    }
+}
+
+// ==========================================
+// 5. MLP 层实现（激活函数为 GELU）
+// ==========================================
+pub struct SparkMlp {
+    gate_proj: Linear,
+    up_proj: Linear,
+    down_proj: Linear,
+}
+
+impl SparkMlp {
+    pub fn load(vb: VarBuilder, cfg: &SparkConfig) -> CandleResult<Self> {
+        let gate_proj = linear_no_bias(cfg.hidden_size, cfg.intermediate_size, vb.pp("gate_proj"))?;
+        let up_proj = linear_no_bias(cfg.hidden_size, cfg.intermediate_size, vb.pp("up_proj"))?;
+        let down_proj = linear_no_bias(cfg.intermediate_size, cfg.hidden_size, vb.pp("down_proj"))?;
+        Ok(Self {
+            gate_proj,
+            up_proj,
+            down_proj,
+        })
+    }
+
+    pub fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
+        // PyTorch: down_proj(act_fn(gate_proj(x)) * up_proj(x))，act_fn = gelu
+        let lhs = self
+            .gate_proj
+            .forward(xs)?
+            .to_dtype(DType::F32)?
+            .gelu_erf()?;
+        let lhs = lhs.to_dtype(xs.dtype())?;
+        let rhs = self.up_proj.forward(xs)?;
+        self.down_proj.forward(&(lhs * rhs)?)
+    }
+}
+
+// ==========================================
+// 6. Spark 解码层组合
+// ==========================================
+pub struct SparkDecoderLayer {
+    input_layernorm: RmsNorm,
+    self_attn: SparkAttention,
+    post_attention_layernorm: RmsNorm,
+    mlp: SparkMlp,
+    is_sliding: bool,
+}
+
+impl SparkDecoderLayer {
+    pub fn load(vb: VarBuilder, cfg: &SparkConfig, layer_idx: usize) -> CandleResult<Self> {
+        let input_layernorm =
+            RmsNorm::load(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
+        let self_attn = SparkAttention::load(vb.pp("self_attn"), cfg, layer_idx)?;
+        let post_attention_layernorm = RmsNorm::load(
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+            vb.pp("post_attention_layernorm"),
+        )?;
+        let mlp = SparkMlp::load(vb.pp("mlp"), cfg)?;
+        Ok(Self {
+            input_layernorm,
+            self_attn,
+            post_attention_layernorm,
+            mlp,
+            is_sliding: cfg.is_sliding(layer_idx),
+        })
+    }
+
+    pub fn forward(
+        &self,
+        xs: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        kv_cache: &mut Option<(Tensor, Tensor)>,
+        pos_offset: usize,
+    ) -> CandleResult<Tensor> {
+        let residual = xs;
+        let xs = self.input_layernorm.forward(xs)?;
+        let xs = self.self_attn.forward(&xs, cos, sin, kv_cache, pos_offset)?;
+        let xs = (xs + residual)?;
+
+        let residual = &xs;
+        let xs = self.post_attention_layernorm.forward(&xs)?;
+        let xs = self.mlp.forward(&xs)?;
+        xs + residual
+    }
+}
+
+// ==========================================
+// 7. SparkModel 核心大模型结构
+// ==========================================
+pub struct SparkModel {
+    embed_tokens: Embedding, // 对应权重名 model.embedding.weight
+    layers: Vec<SparkDecoderLayer>,
+    norm: RmsNorm,
+    lm_head: Linear,
+    // 两种层类型各自独立的位置编码缓存
+    cos_full: Tensor,
+    sin_full: Tensor,
+    cos_sliding: Tensor,
+    sin_sliding: Tensor,
+}
+
+impl SparkModel {
+    pub fn load(vb: VarBuilder, cfg: &SparkConfig, max_seq_len: usize) -> CandleResult<Self> {
+        // 权重带 "model." 前缀（Spark-X2.5 的 base_model_prefix = "model"）
+        let has_model_prefix = vb.contains_tensor("model.embedding.weight")
+            || vb.contains_tensor("model.embed_tokens.weight");
+        let base_vb = if has_model_prefix {
+            vb.pp("model")
+        } else {
+            vb.clone()
+        };
+
+        // 嵌入层：Spark 用的是 "embedding"，其它 Qwen 系可能是 "embed_tokens"
+        let emb_name = if base_vb.pp("embedding").contains_tensor("weight") {
+            "embedding"
+        } else {
+            "embed_tokens"
+        };
+        let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, base_vb.pp(emb_name))?;
+        let norm = RmsNorm::load(cfg.hidden_size, cfg.rms_norm_eps, base_vb.pp("norm"))?;
+
+        let mut layers = Vec::new();
+        let vb_layers = base_vb.pp("layers");
+        for layer_idx in 0..cfg.num_hidden_layers {
+            let layer = SparkDecoderLayer::load(vb_layers.pp(layer_idx), cfg, layer_idx)?;
+            layers.push(layer);
+        }
+
+        // 输出头：tie_word_embeddings=true 时权重不单独存储，直接复用嵌入矩阵
+        let lm_head = if cfg.tie_word_embeddings {
+            Linear::new(embed_tokens.embeddings().clone(), None)
+        } else {
+            linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
+        };
+
+        let head_dim = cfg.head_dim();
+        let (full_theta, full_prf) = cfg.rope_params("full_attention");
+        let (sliding_theta, sliding_prf) = cfg.rope_params("sliding_attention");
+        let (cos_full, sin_full) =
+            create_rope_cache(head_dim, max_seq_len, full_theta, full_prf, vb.device())?;
+        let (cos_sliding, sin_sliding) = create_rope_cache(
+            head_dim,
+            max_seq_len,
+            sliding_theta,
+            sliding_prf,
+            vb.device(),
+        )?;
+
+        Ok(Self {
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+            cos_full,
+            sin_full,
+            cos_sliding,
+            sin_sliding,
+        })
+    }
+
+    pub fn forward(
+        &self,
+        input_ids: &Tensor,
+        pos_offset: usize,
+        kv_caches: &mut [Option<(Tensor, Tensor)>],
+    ) -> CandleResult<Tensor> {
+        let (_b_sz, seq_len) = input_ids.dims2()?;
+        let mut xs = self.embed_tokens.forward(input_ids)?;
+
+        for (idx, layer) in self.layers.iter().enumerate() {
+            let (cos_all, sin_all) = if layer.is_sliding {
+                (&self.cos_sliding, &self.sin_sliding)
+            } else {
+                (&self.cos_full, &self.sin_full)
+            };
+            let cos = cos_all.narrow(0, pos_offset, seq_len)?;
+            let sin = sin_all.narrow(0, pos_offset, seq_len)?;
+            xs = layer.forward(&xs, &cos, &sin, &mut kv_caches[idx], pos_offset)?;
+        }
+
+        let xs = self.norm.forward(&xs)?;
+        let last_token_logits = xs.i((.., seq_len - 1, ..))?;
+        self.lm_head.forward(&last_token_logits)
+    }
+}
+
+// ==========================================
+// 8. 权重与配置文件准备
+// ==========================================
+pub struct ModelFiles {
+    pub config: PathBuf,
+    pub tokenizer: PathBuf,
+    pub weights: Vec<PathBuf>,
+    pub chat_template: PathBuf,
+}
+
+/// 智能检测并下载 Hugging Face 存储库中的模型配置文件与 Safetensors 权重
+pub fn prepare_model_files(repo_id: &str, shard_count: usize) -> AnyhowResult<ModelFiles> {
+    println!("【系统提示】正在检查本地缓存与 HF 远程存储库：{}", repo_id);
+
+    // 自动配置国内高速 HF 镜像源（海外环境可注释此行）
+    std::env::set_var("HF_ENDPOINT", "https://hf-mirror.com");
+
+    let api = ApiBuilder::new()
+        .with_progress(true)
+        .build()
+        .context("初始化 Hugging Face API 客户端失败")?;
+    let repo = api.repo(Repo::new(repo_id.to_string(), RepoType::Model));
+
+    println!("【系统提示】正在同步配置文件 config.json...");
+    let config_path = repo.get("config.json").context("下载 config.json 失败")?;
+
+    println!("【系统提示】正在同步分词器 tokenizer.json...");
+    let tokenizer_path = repo
+        .get("tokenizer.json")
+        .context("下载 tokenizer.json 失败")?;
+
+    println!("【系统提示】正在同步对话模板 chat_template.jinja...");
+    let chat_template_path = repo
+        .get("chat_template.jinja")
+        .context("下载 chat_template.jinja 失败")?;
+
+    // 优先用 index.json 精确推导分片列表，避免手工填错分片数
+    let weight_paths = match repo.get("model.safetensors.index.json") {
+        Ok(index_path) => {
+            println!("【系统提示】已发现分片索引，按其清单下载权重...");
+            let index_str = std::fs::read_to_string(&index_path)
+                .context("读取 model.safetensors.index.json 失败")?;
+            let index: JsonValue = serde_json::from_str(&index_str)?;
+            let weight_map = index
+                .get("weight_map")
+                .and_then(|v| v.as_object())
+                .context("index.json 中缺少 weight_map 字段")?;
+            let mut files: Vec<String> = weight_map
+                .values()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+            files.sort();
+            files.dedup();
+
+            let mut paths = Vec::new();
+            for file_name in files {
+                println!("【系统提示】正在同步权重分片文件 {}...", file_name);
+                let path = repo
+                    .get(&file_name)
+                    .with_context(|| format!("下载权重分片 {} 失败", file_name))?;
+                paths.push(path);
+            }
+            paths
+        }
+        Err(_) => {
+            println!(
+                "【系统提示】仓库未提供索引文件，按分片数 {} 推断文件名...",
+                shard_count
+            );
+            let mut paths = Vec::new();
+            for i in 1..=shard_count {
+                let file_name = format!("model-{:05}-of-{:05}.safetensors", i, shard_count);
+                println!("【系统提示】正在同步权重分片文件 {}...", file_name);
+                let path = repo
+                    .get(&file_name)
+                    .with_context(|| format!("下载权重分片 {} 失败", file_name))?;
+                paths.push(path);
+            }
+            paths
+        }
+    };
+
+    println!("【系统提示】本地模型文件状态完好，全部校验成功！\n");
+    Ok(ModelFiles {
+        config: config_path,
+        tokenizer: tokenizer_path,
+        weights: weight_paths,
+        chat_template: chat_template_path,
+    })
+}
