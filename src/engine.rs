@@ -21,7 +21,8 @@ pub struct GenOptions {
     pub seed: Option<u64>,
     pub enable_thinking: bool,
 }
-pub const DEFAULT_MAX_TOKEN: usize = 8192; // 512
+/// 未显式指定时的默认生成长度：给足上下文，避免长回答被拦腰截断
+pub const DEFAULT_MAX_TOKEN: usize = 8192;
 impl Default for GenOptions {
     fn default() -> Self {
         Self {
@@ -108,6 +109,39 @@ struct EngineInner {
     size_bytes: u64,
     modified_secs: u64,
     dtype: String,
+}
+
+/// 诊断日志中单段文本保留的头部 / 尾部字符数
+///
+/// 超长对话每轮都会被截断，若不裁剪，一条日志就能写进几十 KB
+const LOG_TEXT_HEAD_TAIL: usize = 1000;
+
+/// 把 Token 序列解码回文本
+fn decode_ids(tokenizer: &Tokenizer, ids: &[u32]) -> String {
+    tokenizer
+        .decode(ids, true)
+        .unwrap_or_else(|e| format!("<解码失败: {e}>"))
+}
+
+/// 超长文本压缩成「头部 + 中间省略说明 + 尾部」，短文本原样返回
+fn preview_text(text: &str) -> String {
+    let total = text.chars().count();
+    if total <= LOG_TEXT_HEAD_TAIL * 2 {
+        return text.to_string();
+    }
+    let omitted = total - LOG_TEXT_HEAD_TAIL * 2;
+    let head: String = text.chars().take(LOG_TEXT_HEAD_TAIL).collect();
+    let tail: String = text.chars().skip(total - LOG_TEXT_HEAD_TAIL).collect();
+    format!("{head}\n…（中间省略 {omitted} 字符）…\n{tail}")
+}
+
+/// 把对话消息拼成便于阅读的原文，供诊断日志使用
+fn format_messages(messages: &[Message]) -> String {
+    messages
+        .iter()
+        .map(|m| format!("[{}] {}", m.role, m.content))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// 统计权重文件的总大小与最后修改时间
@@ -365,32 +399,43 @@ impl Engine {
             .to_vec();
 
         // 生成预算受上下文上限约束：prompt + max_tokens 必须能放进 max_context，
-        // 否则前向推理时 RoPE 缓存会被越界切片，直接导致推理失败
+        // 否则前向推理时 RoPE 缓存会被越界切片，直接导致推理失败。
+        // 提示词优先：只有提示词自身超限才丢弃最早的 Token，剩余空间全部留给生成
         let max_ctx = inner.max_context.max(2);
-        let mut max_tokens = opts.max_tokens.max(1).min(max_ctx - 1);
-        // 提示词至少保留一半上下文，避免过大的 max_tokens 把提示词整个挤掉
-        if ids.len() > max_ctx.saturating_sub(max_tokens) {
-            max_tokens = max_tokens.min(max_ctx.saturating_sub(max_ctx / 2).max(1));
-            warn!(
-                target: "gen",
-                requested = opts.max_tokens,
-                allowed = max_tokens,
-                "max_tokens 超出上下文预算，已夹取"
-            );
-        }
-        let budget = max_ctx.saturating_sub(max_tokens).max(1);
-        if ids.len() > budget {
-            let cut = ids.len() - budget;
+        let prompt_budget = max_ctx - 1; // 至少留一个位置给生成
+        if ids.len() > prompt_budget {
+            let cut = ids.len() - prompt_budget;
+            // 先解码再裁剪：日志要同时留下被丢弃的部分与真正送进模型的部分
+            let dropped = decode_ids(&inner.tokenizer, &ids[..cut]);
+            let retained = decode_ids(&inner.tokenizer, &ids[cut..]);
+            let original = format_messages(&messages);
             ids.drain(..cut);
             warn!(
                 target: "gen",
                 truncated = cut,
-                budget,
+                budget = prompt_budget,
+                dropped_chars = dropped.chars().count(),
+                retained_chars = retained.chars().count(),
+                original_input = %preview_text(&original),
+                dropped_text = %preview_text(&dropped),
+                retained_text = %preview_text(&retained),
                 "提示词超出上下文预算，已丢弃最早的若干 Token"
             );
         }
         let prompt_len = ids.len();
-        max_tokens = max_tokens.min(max_ctx.saturating_sub(prompt_len).max(1));
+        let allowed = max_ctx - prompt_len;
+        let max_tokens = opts.max_tokens.max(1).min(allowed);
+        if max_tokens < opts.max_tokens {
+            // 客户端常常直接塞一个远超上下文的 max_tokens，属常规情况，不打扰日志
+            debug!(
+                target: "gen",
+                requested = opts.max_tokens,
+                allowed,
+                prompt_tokens = prompt_len,
+                context = max_ctx,
+                "max_tokens 超出剩余上下文预算，已夹取"
+            );
+        }
         let opts = GenOptions { max_tokens, ..opts };
         info!(
             target: "gen",

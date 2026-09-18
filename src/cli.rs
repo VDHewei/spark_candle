@@ -3,6 +3,11 @@
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
+use crate::engine::DEFAULT_MAX_TOKEN;
+
+/// 默认上下文上限（Prompt + 生成）
+const DEFAULT_MAX_CONTEXT: usize = 8192;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "spark_candle",
@@ -37,15 +42,15 @@ pub struct CommonArgs {
     pub dtype: Option<String>,
 
     /// 上下文上限（Prompt + 生成）
-    #[arg(long, default_value_t = 8192)]
+    #[arg(long, default_value_t = DEFAULT_MAX_CONTEXT)]
     pub max_context: usize,
 
     /// 默认系统提示词
     #[arg(long)]
     pub system: Option<String>,
 
-    /// 单次生成的最大 Token 数
-    #[arg(long, default_value_t = 512)]
+    /// 单次生成的最大 Token 数；超过上下文上限时会自动夹取
+    #[arg(long, default_value_t = DEFAULT_MAX_TOKEN)]
     pub max_tokens: usize,
 
     /// 采样温度，0 表示贪婪解码
@@ -85,9 +90,9 @@ impl Default for CommonArgs {
             model: "XHToken/Spark-X2.5-1.7B".to_string(),
             shards: 2,
             dtype: None,
-            max_context: 4096,
+            max_context: DEFAULT_MAX_CONTEXT,
             system: None,
-            max_tokens: 8192, // 512
+            max_tokens: DEFAULT_MAX_TOKEN,
             temperature: 0.7,
             top_p: 0.95,
             seed: None,
@@ -143,8 +148,12 @@ impl CommonArgs {
     }
 
     pub fn gen_options(&self, max_tokens: Option<usize>) -> crate::engine::GenOptions {
+        // 生成预算不可能超过上下文上限，这里先按上下文夹一次，避免运行时再被裁剪
+        let max_tokens = max_tokens
+            .unwrap_or(self.max_tokens)
+            .min(self.max_context.saturating_sub(1).max(1));
         crate::engine::GenOptions {
-            max_tokens: max_tokens.unwrap_or(self.max_tokens),
+            max_tokens,
             temperature: self.temperature,
             top_p: self.top_p,
             seed: self.seed,

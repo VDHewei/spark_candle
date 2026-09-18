@@ -33,6 +33,7 @@ fn load_engine(common: &CommonArgs, mode: &str) -> Result<Arc<Engine>> {
         model = %common.model,
         mode,
         max_context = common.max_context,
+        max_tokens = common.gen_options(None).max_tokens,
         "开始加载模型"
     );
     Engine::load(
