@@ -2,7 +2,7 @@
 
 use crate::chat::Message;
 use crate::cli::ServeArgs;
-use crate::engine::{Engine, GenOptions, Generation};
+use crate::engine::{preview_text, Engine, GenOptions, Generation};
 use axum::{
     body::{Body, Bytes},
     extract::State,
@@ -1192,18 +1192,64 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
     }))
 }
 
-/// 记录每次 HTTP 访问的方法、路径、状态码与耗时
+/// 记录请求体时允许读取的最大字节数（与 axum 的 Json 默认上限一致）
+const LOG_BODY_LIMIT: usize = 2 * 1024 * 1024;
+
+/// 记录每次 HTTP 访问的方法、URI、状态码与耗时
+///
+/// 请求体只能被消费一次：先读进内存再原样回填给下游 handler，
+/// 请求失败时把 URI 与请求体一并落日志，便于还原客户端到底发了什么
 async fn trace_request(req: Request<Body>, next: Next) -> Response {
     let method = req.method().clone();
     let uri = req.uri().clone();
     let started = Instant::now();
+
+    // 声明了超大体量的请求直接跳过读取，交给 handler 按自己的上限拒绝
+    let oversized = req
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+        .is_some_and(|len| len > LOG_BODY_LIMIT);
+
+    let (req, body_text) = if method == Method::GET || method == Method::HEAD || oversized {
+        let note = oversized.then(|| format!("<请求体超过 {LOG_BODY_LIMIT} 字节，未记录>"));
+        (req, note)
+    } else {
+        let (parts, body) = req.into_parts();
+        match axum::body::to_bytes(body, LOG_BODY_LIMIT).await {
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes).into_owned();
+                (Request::from_parts(parts, Body::from(bytes)), Some(text))
+            }
+            Err(_) => {
+                warn!(
+                    target: "http",
+                    %method, %uri, limit = LOG_BODY_LIMIT,
+                    "请求体超过上限，已拒绝"
+                );
+                return error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!("请求体超过 {LOG_BODY_LIMIT} 字节上限"),
+                );
+            }
+        }
+    };
+
     let res = next.run(req).await;
     let elapsed_ms = started.elapsed().as_millis();
     let status = res.status().as_u16();
+    // 失败时才带上请求体：成功路径的入参已由 api 目标的日志覆盖
+    let body = body_text.as_deref().unwrap_or("");
     if res.status().is_success() {
         info!(target: "http", %method, %uri, status, elapsed_ms, "请求完成");
     } else {
-        warn!(target: "http", %method, %uri, status, elapsed_ms, "请求异常");
+        warn!(
+            target: "http",
+            %method, %uri, status, elapsed_ms,
+            body = %preview_text(body),
+            "请求异常"
+        );
     }
     res
 }

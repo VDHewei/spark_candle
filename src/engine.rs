@@ -124,7 +124,7 @@ fn decode_ids(tokenizer: &Tokenizer, ids: &[u32]) -> String {
 }
 
 /// 超长文本压缩成「头部 + 中间省略说明 + 尾部」，短文本原样返回
-fn preview_text(text: &str) -> String {
+pub(crate) fn preview_text(text: &str) -> String {
     let total = text.chars().count();
     if total <= LOG_TEXT_HEAD_TAIL * 2 {
         return text.to_string();

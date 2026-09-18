@@ -7,3 +7,7 @@
 .docker/
 *.ps1
 _tls/
+*.py
+*.pyi
+*.tmp
+*.rs~
