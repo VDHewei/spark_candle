@@ -25,17 +25,26 @@ use std::thread;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
-/// 后台线程推送的事件，携带世代号以便丢弃被取消的生成任务
+/// 后台生成线程推送给主循环的事件
+///
+/// 每个事件都携带**世代号**（`gen`），主循环只接受与当前世代一致的事件，
+/// 这样被用户取消、但仍在收尾的旧任务就不会污染界面。
 enum WorkerEvent {
+    /// 增量文本（世代号, 新增内容）
     Delta(u64, String),
+    /// 生成结束（世代号, 完整结果或错误信息）
     Done(u64, std::result::Result<GenResult, String>),
 }
 
+/// 界面上的一条气泡：角色标签 + 文本（流式过程中会被不断追加）
 struct ViewItem {
+    /// 展示用的角色名：`你` / `Spark` / `系统`
     role: String,
+    /// 文本内容
     text: String,
 }
 
+/// TUI 的全部可变状态
 struct App {
     engine: Arc<Engine>,
     opts: GenOptions,
@@ -54,8 +63,17 @@ struct App {
     tx: Sender<WorkerEvent>,
 }
 
+/// 状态栏常驻显示的快捷键提示
 const HELP: &str = "Enter 发送 · Alt+Enter 换行 · ↑/↓ 或 PgUp/PgDn 滚动 · /clear 清空 · /reset 重置缓存 · /exit 退出";
 
+/// TUI 入口：接管终端 → 跑事件循环 → 无论如何都恢复终端
+///
+/// 进入备用屏幕、开启 raw mode，退出前必定执行反向操作，
+/// 即使事件循环返回错误也不会把终端留在「卡死」状态。
+///
+/// # 参数
+/// - `engine`：已加载的引擎
+/// - `args`：`chat` 子命令参数（决定采样参数与初始提示）
 pub fn run(engine: Arc<Engine>, args: ChatArgs) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -71,6 +89,18 @@ pub fn run(engine: Arc<Engine>, args: ChatArgs) -> Result<()> {
     result
 }
 
+/// 主事件循环：50ms 轮询按键 → 拉取后台增量 → 重绘界面
+///
+/// 生成跑在独立线程里（见 `submit`），主线程只负责收增量与渲染，
+/// 因此流式输出与用户输入不会互相阻塞。
+///
+/// # 参数
+/// - `terminal`：ratatui 终端句柄
+/// - `engine`：已加载的引擎
+/// - `args`：`chat` 子命令参数
+///
+/// # 返回
+/// 用户输入 `/exit`、空闲时按 Esc / Ctrl+C，或底层 IO 出错时返回
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     engine: Arc<Engine>,
@@ -194,6 +224,12 @@ fn event_loop(
 }
 
 /// 取消当前生成：自增世代号让后台增量作废，并丢弃 KV-Cache
+///
+/// 顺序很关键：先置中断标志让后台线程尽快收尾，再 `reset()` 丢掉
+/// 停在半截状态的缓存；最后把刚加入历史的用户消息撤回，避免会话错位。
+///
+/// # 参数
+/// - `app`：TUI 状态（就地修改）
 fn cancel(app: &mut App) {
     warn!(target: "tui", produced = app.view.last().map(|v| v.text.chars().count()).unwrap_or(0), "用户取消生成");
     app.gen += 1;
@@ -213,7 +249,17 @@ fn cancel(app: &mut App) {
     app.status = format!("已取消本次生成。 · {}", HELP);
 }
 
-/// 处理回车提交，返回 true 表示退出 TUI
+/// 处理回车提交：识别内置命令，或把用户输入丢给后台线程生成
+///
+/// 内置命令：`/exit` `/quit` `/q`（退出）、`/clear`（清空会话与缓存）、
+/// `/reset`（仅重置 KV-Cache）、`/help`（打印快捷键）。
+/// 普通文本则入历史、起后台线程流式生成。
+///
+/// # 参数
+/// - `app`：TUI 状态（就地修改）
+///
+/// # 返回
+/// `true` 表示应退出 TUI；生成中或输入为空时返回 `false`
 fn submit(app: &mut App) -> bool {
     if app.busy {
         return false;
@@ -291,6 +337,11 @@ fn submit(app: &mut App) -> bool {
     false
 }
 
+/// 绘制整屏：对话区（可滚动） + 输入区（含光标） + 状态栏
+///
+/// # 参数
+/// - `f`：ratatui 的当前帧
+/// - `app`：TUI 状态（只读）
 fn ui(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -363,7 +414,17 @@ fn ui(f: &mut Frame, app: &App) {
     );
 }
 
-/// 把消息渲染为按给定宽度折行后的文本行（自行折行以便精确控制滚动）
+/// 把消息渲染为按给定宽度折行后的文本行
+///
+/// 自己折行而不是交给 `Paragraph::wrap`，是为了拿到精确的总行数，
+/// 从而算出滚动上限（`follow` 模式要自动贴底）。
+///
+/// # 参数
+/// - `app`：TUI 状态
+/// - `width`：对话区可用宽度（列数）
+///
+/// # 返回
+/// 可直接交给 `Paragraph` 的行列表
 fn build_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     for item in &app.view {
@@ -394,6 +455,14 @@ fn build_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     lines
 }
 
+/// 按显示宽度把一行文本切成多行（CJK 算 2 列）
+///
+/// # 参数
+/// - `line`：单行文本（不含换行符）
+/// - `width`：每行允许的最大显示宽度
+///
+/// # 返回
+/// 切分后的行列表；即使 `line` 为空也会返回包含一个空串的列表
 fn wrap_line(line: &str, width: usize) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();
@@ -411,7 +480,13 @@ fn wrap_line(line: &str, width: usize) -> Vec<String> {
     out
 }
 
-/// 粗略的显示宽度：CJK / 全角算 2，其余算 1
+/// 粗略的显示宽度：CJK / 全角算 2 列，其余算 1 列
+///
+/// 覆盖的 Unicode 区间：Hangul Jamo、CJK 部首与汉字、韩文音节、
+/// CJK 兼容表意文字、CJK 兼容形式、全角 ASCII、全角符号、CJK 扩展 B。
+///
+/// # 参数
+/// - `c`：待测量字符
 fn char_width(c: char) -> usize {
     let u = c as u32;
     let wide = (0x1100..=0x115F).contains(&u)

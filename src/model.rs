@@ -808,7 +808,19 @@ pub struct ModelFiles {
     pub chat_template: PathBuf,
 }
 
-/// 智能检测并下载 Hugging Face 存储库中的模型配置文件与 Safetensors 权重
+/// 检查本地缓存并按需下载 Hugging Face 仓库中的配置与权重文件
+///
+/// 流程：设置镜像 → 建 API 客户端 → 取 config/tokenizer/模板 →
+/// 有 `model.safetensors.index.json` 时按其清单取分片，
+/// 否则按 `shard_count` 推断 `model-00001-of-000NN.safetensors`。
+/// 已缓存的文件不会重复下载（由 `hf-hub` 保证）。
+///
+/// # 参数
+/// - `repo_id`：仓库 ID，如 `XHToken/Spark-X2.5-1.7B`
+/// - `shard_count`：缺少 index.json 时的分片数（对应 `--shards`）
+///
+/// # 返回
+/// 各文件的本地路径；下载失败或 index.json 缺少 `weight_map` 时返回错误
 pub fn prepare_model_files(repo_id: &str, shard_count: usize) -> AnyhowResult<ModelFiles> {
     println!("【系统提示】正在检查本地缓存与 HF 远程存储库：{}", repo_id);
 
