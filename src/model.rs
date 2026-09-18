@@ -593,15 +593,27 @@ impl SparkMlp {
 // ==========================================
 // 6. Spark 解码层组合
 // ==========================================
+/// 单个解码层：RMSNorm → 注意力（残差）→ RMSNorm → MLP（残差）
 pub struct SparkDecoderLayer {
+    /// 注意力前的 RMSNorm
     input_layernorm: RmsNorm,
+    /// 混合注意力层
     self_attn: SparkAttention,
+    /// MLP 前的 RMSNorm
     post_attention_layernorm: RmsNorm,
+    /// 前馈网络
     mlp: SparkMlp,
+    /// 是否滑动窗口层（决定用哪套 RoPE 缓存）
     is_sliding: bool,
 }
 
 impl SparkDecoderLayer {
+    /// 从 VarBuilder（已定位到 `layers.<idx>`）加载整层权重
+    ///
+    /// # 参数
+    /// - `vb`：定位到本层的 VarBuilder
+    /// - `cfg`：模型配置
+    /// - `layer_idx`：层序号
     pub fn load(vb: VarBuilder, cfg: &SparkConfig, layer_idx: usize) -> CandleResult<Self> {
         let input_layernorm =
             RmsNorm::load(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
@@ -621,6 +633,16 @@ impl SparkDecoderLayer {
         })
     }
 
+    /// 前向：两轮「归一化 → 子层 → 加残差」
+    ///
+    /// # 参数
+    /// - `xs`：形状 `[b, seq, hidden]`
+    /// - `cos` / `sin`：本段 RoPE 切片
+    /// - `kv_cache`：本层 KV 缓存（就地更新）
+    /// - `pos_offset`：本段起始绝对位置
+    ///
+    /// # 返回
+    /// 同形状的层输出
     pub fn forward(
         &self,
         xs: &Tensor,
@@ -644,19 +666,40 @@ impl SparkDecoderLayer {
 // ==========================================
 // 7. SparkModel 核心大模型结构
 // ==========================================
+/// `Spark2_5ForCausalLM` 的主体：嵌入 + N 层解码器 + 输出头 + 两套 RoPE 缓存
 pub struct SparkModel {
-    embed_tokens: Embedding, // 对应权重名 model.embedding.weight
+    /// 词嵌入，对应权重名 `model.embedding.weight`
+    embed_tokens: Embedding,
+    /// 全部解码层
     layers: Vec<SparkDecoderLayer>,
+    /// 输出前的最终 RMSNorm
     norm: RmsNorm,
+    /// 输出投影；`tie_word_embeddings` 时与嵌入共享权重
     lm_head: Linear,
     // 两种层类型各自独立的位置编码缓存
+    /// 全注意力层的 cos 缓存
     cos_full: Tensor,
+    /// 全注意力层的 sin 缓存
     sin_full: Tensor,
+    /// 滑动窗口层的 cos 缓存
     cos_sliding: Tensor,
+    /// 滑动窗口层的 sin 缓存
     sin_sliding: Tensor,
 }
 
 impl SparkModel {
+    /// 构建模型结构并绑定权重
+    ///
+    /// 自动兼容三种常见差异：权重是否带 `model.` 前缀、嵌入叫 `embedding`
+    /// 还是 `embed_tokens`、输出头是否与嵌入共享（`tie_word_embeddings`）。
+    ///
+    /// # 参数
+    /// - `vb`：根 VarBuilder（已内存映射 Safetensors）
+    /// - `cfg`：模型配置
+    /// - `max_seq_len`：RoPE 缓存长度（= `--max-context`）
+    ///
+    /// # 返回
+    /// 就绪的 `SparkModel`；权重缺失或形状不符时返回错误
     pub fn load(vb: VarBuilder, cfg: &SparkConfig, max_seq_len: usize) -> CandleResult<Self> {
         // 权重带 "model." 前缀（Spark-X2.5 的 base_model_prefix = "model"）
         let has_model_prefix = vb.contains_tensor("model.embedding.weight")
@@ -715,6 +758,15 @@ impl SparkModel {
         })
     }
 
+    /// 前向推理：只返回**最后一个位置**的 logits（自回归解码只需下一步）
+    ///
+    /// # 参数
+    /// - `input_ids`：形状 `[b, seq]` 的 Token id
+    /// - `pos_offset`：本段在整段序列中的起始绝对位置（用于 RoPE 切片）
+    /// - `kv_caches`：每层一份 KV 缓存，长度需等于层数（就地更新）
+    ///
+    /// # 返回
+    /// 形状 `[b, vocab]` 的 logits
     pub fn forward(
         &self,
         input_ids: &Tensor,
@@ -744,10 +796,15 @@ impl SparkModel {
 // ==========================================
 // 8. 权重与配置文件准备
 // ==========================================
+/// 模型加载所需的全部本地文件路径（已确保存在于 HF 缓存中）
 pub struct ModelFiles {
+    /// `config.json`
     pub config: PathBuf,
+    /// `tokenizer.json`
     pub tokenizer: PathBuf,
+    /// Safetensors 分片（按文件名排序，已去重）
     pub weights: Vec<PathBuf>,
+    /// `chat_template.jinja`
     pub chat_template: PathBuf,
 }
 
