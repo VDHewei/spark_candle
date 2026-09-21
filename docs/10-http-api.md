@@ -86,6 +86,10 @@ curl http://127.0.0.1:8000/api/v1/chat/completions \
 
 客户端配置：`base_url = http://127.0.0.1:8000/api/v1`，`api_key` 任意。
 
+> 路径别名：`/v1/...`、`/chat/completions`、`/messages` 同样可用，
+> 便于 `base_url` 配成 `http://127.0.0.1:8000` 或 `.../v1` 的客户端直接接入。
+> 命中不了任何路由时返回 404 JSON，并在 `error.message` 里列出可用端点。
+
 ---
 
 ## Anthropic Messages

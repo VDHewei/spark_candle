@@ -1453,8 +1453,32 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
     }))
 }
 
+/// 未命中任何路由时的兜底响应：返回 OpenAI 风格 404 并列出可用端点
+///
+/// 客户端（尤其是各类 agent）的 `base_url` 约定不一，
+/// 直接在错误里给出正确路径，省得翻日志才知道拼错了前缀。
+async fn not_found(req: Request<Body>) -> Response {
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    error_response(
+        StatusCode::NOT_FOUND,
+        format!(
+            "{method} {uri} 未匹配到任何端点；可用：\
+             POST /api/v1/messages（别名 /v1/messages、/messages）、\
+             POST /api/v1/chat/completions（别名 /v1/chat/completions）、\
+             POST /api/chat、POST /api/generate、GET /api/v1/models、GET /api/health"
+        ),
+    )
+}
+
 /// 记录请求体时允许读取的最大字节数（与 axum 的 Json 默认上限一致）
 const LOG_BODY_LIMIT: usize = 2 * 1024 * 1024;
+
+/// 超过该大小的请求体不再缓冲进内存用于记日志（仍原样透传给 handler）
+///
+/// agent 类客户端常带几万字的系统提示与工具定义，
+/// 每个请求都全量缓冲一遍既浪费内存，也会把日志撑成几十 KB 一条。
+const LOG_BODY_CAPTURE_LIMIT: usize = 64 * 1024;
 
 /// 记录每次 HTTP 访问的方法、URI、状态码与耗时
 ///
@@ -1465,16 +1489,19 @@ async fn trace_request(req: Request<Body>, next: Next) -> Response {
     let uri = req.uri().clone();
     let started = Instant::now();
 
-    // 声明了超大体量的请求直接跳过读取，交给 handler 按自己的上限拒绝
-    let oversized = req
+    // 请求体只缓冲小体积的用于记日志；超限的直接透传，不再整份读进内存
+    let content_length: Option<usize> = req
         .headers()
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<usize>().ok())
-        .is_some_and(|len| len > LOG_BODY_LIMIT);
+        .and_then(|v| v.parse::<usize>().ok());
+    let skip_capture = matches!(method, Method::GET | Method::HEAD)
+        || content_length.is_some_and(|len| len > LOG_BODY_CAPTURE_LIMIT);
 
-    let (req, body_text) = if method == Method::GET || method == Method::HEAD || oversized {
-        let note = oversized.then(|| format!("<请求体超过 {LOG_BODY_LIMIT} 字节，未记录>"));
+    let (req, body_text) = if skip_capture {
+        let note = content_length
+            .filter(|len| *len > LOG_BODY_CAPTURE_LIMIT)
+            .map(|len| format!("<请求体 {len} 字节，超过日志采集上限，未记录内容>"));
         (req, note)
     } else {
         let (parts, body) = req.into_parts();
@@ -1599,6 +1626,13 @@ pub async fn run(engine: Arc<Engine>, args: ServeArgs) -> anyhow::Result<()> {
         .route("/api/v1/models", get(models))
         .route("/api/v1/chat/completions", post(openai_chat))
         .route("/api/v1/messages", post(anthropic_messages))
+        // 无 /api 前缀的别名：客户端把 base_url 配成 …:port 或 …:port/v1 时也能命中
+        .route("/health", get(health))
+        .route("/v1/models", get(models))
+        .route("/v1/chat/completions", post(openai_chat))
+        .route("/chat/completions", post(openai_chat))
+        .route("/v1/messages", post(anthropic_messages))
+        .route("/messages", post(anthropic_messages))
         // Ollama 兼容端点
         .route("/", get(ollama_root))
         .route("/api/version", get(ollama_version))
@@ -1608,6 +1642,7 @@ pub async fn run(engine: Arc<Engine>, args: ServeArgs) -> anyhow::Result<()> {
         .route("/api/chat", post(ollama_chat))
         .route("/api/generate", post(ollama_generate))
         .route("/api/embeddings", post(ollama_embeddings))
+        .fallback(not_found)
         .with_state(state)
         .layer(middleware::from_fn(cors))
         .layer(middleware::from_fn(trace_request));
